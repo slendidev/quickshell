@@ -8,6 +8,7 @@
 #include <qqueue.h>
 #include <qstring.h>
 #include <qtcpsocket.h>
+#include <qdatetime.h>
 #include <qtimer.h>
 #include <qtypes.h>
 #include <qvariant.h>
@@ -192,9 +193,13 @@ void updateStatus();
 void updateCurrentSong();
 void updateAlbumArt();
 void clearTrackData();
+void onPositionTimeout();
 QString escapeMpdString(const QString& value) const;
 qreal clamp01(qreal value) const;
 void setSongField(const QString& key, const QString& value);
+qreal positionFromSampleNow() const;
+void setPositionSample(qreal sampleSeconds);
+void refreshPositionFromSample();
 
 Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(Mpd, QString, bHost, "127.0.0.1", &Mpd::hostChanged);
 Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(Mpd, quint16, bPort, 6600, &Mpd::portChanged);
@@ -204,6 +209,7 @@ Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(Mpd, bool, bAutoReconnect, true, &Mpd::auto
 QTcpSocket mSocket;
 QTimer mPollTimer;
 QTimer mReconnectTimer;
+	QTimer mPositionTimer;
 MpdPlayer mPlayer;
 QQueue<MpdCommand> mCommandQueue;
 QVariantMap mResponseMap;
@@ -211,6 +217,9 @@ QVariantMap mSongMap;
 QByteArray mReadBuffer;
 QByteArray mBinaryData;
 qint64 mExpectedBinaryBytes = 0;
+	qreal mPositionSampleSeconds = 0;
+	QDateTime mPositionSampleTimestamp;
+	bool mPositionSampleValid = false;
 	bool mRunningCommand = false;
 	bool mAcceptedGreeting = false;
 };

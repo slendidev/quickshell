@@ -30,6 +30,9 @@ target_include_directories(quickshell-dbusmenu PRIVATE ${CMAKE_CURRENT_BINARY_DI
 target_link_libraries(quickshell-dbusmenu PRIVATE Qt::Quick Qt::DBus)
 qs_add_link_dependencies(quickshell-dbusmenu quickshell-dbus)
 
+# Ensure dbus interface codegen in ../ is available before this target's autogen step.
+set_property(TARGET quickshell-dbusmenu APPEND PROPERTY AUTOGEN_TARGET_DEPENDS quickshell-dbus)
+
 qs_module_pch(quickshell-dbusmenu SET dbus)
 
 target_link_libraries(quickshell PRIVATE quickshell-dbusmenuplugin)

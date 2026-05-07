@@ -1,6 +1,7 @@
 #include "mpd.hpp"
 
 #include <qbytearray.h>
+#include <qdatetime.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qqueue.h>
@@ -50,6 +51,8 @@ this->mPollTimer.setInterval(1000);
 this->mPollTimer.setSingleShot(false);
 this->mReconnectTimer.setInterval(2000);
 this->mReconnectTimer.setSingleShot(true);
+	this->mPositionTimer.setInterval(250);
+	this->mPositionTimer.setSingleShot(false);
 
 // clang-format off
 QObject::connect(&this->mSocket, &QTcpSocket::connected, this, &Mpd::onConnected);
@@ -58,6 +61,7 @@ QObject::connect(&this->mSocket, &QTcpSocket::readyRead, this, &Mpd::onReadyRead
 QObject::connect(&this->mSocket, &QTcpSocket::errorOccurred, this, &Mpd::onSocketError);
 QObject::connect(&this->mPollTimer, &QTimer::timeout, this, &Mpd::onPollTimeout);
 QObject::connect(&this->mReconnectTimer, &QTimer::timeout, this, &Mpd::reconnect);
+	QObject::connect(&this->mPositionTimer, &QTimer::timeout, this, &Mpd::onPositionTimeout);
 QObject::connect(&this->mPlayer, &MpdPlayer::positionChangeRequested, this, [this](qreal position) {
 auto command = QString("seekcur %1").arg(position, 0, 'f', 3);
 this->sendCommand(command);
@@ -99,12 +103,16 @@ this->bAutoReconnect = autoReconnect;
 void Mpd::reconnect() {
 this->mReconnectTimer.stop();
 this->mPollTimer.stop();
+	this->mPositionTimer.stop();
 this->mCommandQueue.clear();
 this->mReadBuffer.clear();
 this->mResponseMap.clear();
 this->mSongMap.clear();
 this->mBinaryData.clear();
 	this->mExpectedBinaryBytes = 0;
+	this->mPositionSampleSeconds = 0;
+	this->mPositionSampleTimestamp = QDateTime();
+	this->mPositionSampleValid = false;
 	this->mRunningCommand = false;
 	this->mAcceptedGreeting = false;
 
@@ -152,6 +160,7 @@ this->clearTrackData();
 emit this->connectedChanged();
 
 this->mPollTimer.stop();
+	this->mPositionTimer.stop();
 this->mCommandQueue.clear();
 this->mRunningCommand = false;
 this->mAcceptedGreeting = false;
@@ -172,6 +181,8 @@ qCWarning(logMpd) << "MPD socket error:" << this->mSocket.errorString();
 }
 
 void Mpd::onPollTimeout() { this->updateState(); }
+
+void Mpd::onPositionTimeout() { this->refreshPositionFromSample(); }
 
 void Mpd::sendCommand(const QString& command, const std::function<void(bool)>& callback) {
 this->mCommandQueue.enqueue({command, callback});
@@ -287,6 +298,7 @@ void Mpd::updateStatus() {
 this->sendCommand("status", [this](bool success) {
 if (!success) return;
 
+	auto previousState = this->mPlayer.bindablePlaybackState().value();
 auto state = this->mResponseMap.value("state").toString();
 if (state == "play") {
 this->mPlayer.setPlaybackState(MpdPlaybackState::Playing);
@@ -300,8 +312,29 @@ auto elapsed = this->mResponseMap.value("elapsed").toDouble();
 auto duration = this->mResponseMap.value("duration").toDouble();
 		auto volume = this->mResponseMap.value("volume").toDouble() / 100.0;
 
-		if (elapsed >= 0) {
-			this->mPlayer.setPositionInternal(elapsed);
+		if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing) {
+			if (!this->mPositionTimer.isActive()) this->mPositionTimer.start();
+
+			if (elapsed >= 0) {
+				if (!this->mPositionSampleValid) {
+					this->setPositionSample(elapsed);
+				} else {
+					auto predicted = this->positionFromSampleNow();
+					if (elapsed + 0.35 >= predicted) this->setPositionSample(elapsed);
+				}
+			}
+
+			this->refreshPositionFromSample();
+		} else {
+			this->mPositionTimer.stop();
+			if (elapsed >= 0) this->setPositionSample(elapsed);
+			this->refreshPositionFromSample();
+		}
+
+		if (previousState != this->mPlayer.bindablePlaybackState().value()) {
+			if (this->mPlayer.bindablePlaybackState().value() != MpdPlaybackState::Playing) {
+				this->mPositionTimer.stop();
+			}
 		}
 
 if (duration >= 0) this->mPlayer.setLength(duration);
@@ -342,6 +375,9 @@ auto newFile = this->mSongMap.value("file").toString();
 this->mPlayer.setTrackFile(newFile);
 
 if (oldFile != newFile) {
+	this->mPositionSampleSeconds = 0;
+	this->mPositionSampleTimestamp = QDateTime();
+	this->mPositionSampleValid = false;
 this->mPlayer.setTrackArtUrl(QString());
 this->updateAlbumArt();
 }
@@ -384,6 +420,10 @@ applyPicture(fallbackSuccess);
 }
 
 void Mpd::clearTrackData() {
+	this->mPositionTimer.stop();
+	this->mPositionSampleSeconds = 0;
+	this->mPositionSampleTimestamp = QDateTime();
+	this->mPositionSampleValid = false;
 this->mPlayer.setPlaybackState(MpdPlaybackState::Stopped);
 this->mPlayer.setTrackTitle(QString());
 this->mPlayer.setTrackArtist(QString());
@@ -393,6 +433,33 @@ this->mPlayer.setTrackFile(QString());
 this->mPlayer.setMetadata(QVariantMap());
 this->mPlayer.setPositionInternal(0);
 this->mPlayer.setLength(0);
+}
+
+qreal Mpd::positionFromSampleNow() const {
+	if (!this->mPositionSampleValid) return this->mPlayer.bindablePosition().value();
+
+	auto position = this->mPositionSampleSeconds;
+	if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing
+	    && this->mPositionSampleTimestamp.isValid()) {
+		position += static_cast<qreal>(
+		    this->mPositionSampleTimestamp.msecsTo(QDateTime::currentDateTimeUtc())
+		) / 1000.0;
+	}
+
+	auto length = this->mPlayer.bindableLength().value();
+	if (length > 0 && position > length) position = length;
+	if (position < 0) position = 0;
+	return position;
+}
+
+void Mpd::setPositionSample(qreal sampleSeconds) {
+	this->mPositionSampleSeconds = sampleSeconds;
+	this->mPositionSampleTimestamp = QDateTime::currentDateTimeUtc();
+	this->mPositionSampleValid = true;
+}
+
+void Mpd::refreshPositionFromSample() {
+	this->mPlayer.setPositionInternal(this->positionFromSampleNow());
 }
 
 QString Mpd::escapeMpdString(const QString& value) const {
