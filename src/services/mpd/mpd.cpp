@@ -1,13 +1,11 @@
 #include "mpd.hpp"
 
 #include <qbytearray.h>
-#include <qdatetime.h>
 #include <qlogging.h>
 #include <qloggingcategory.h>
 #include <qqueue.h>
 #include <qstringlist.h>
 #include <qtimer.h>
-#include <qurl.h>
 
 #include "../../core/logcat.hpp"
 
@@ -106,11 +104,9 @@ this->mReadBuffer.clear();
 this->mResponseMap.clear();
 this->mSongMap.clear();
 this->mBinaryData.clear();
-this->mExpectedBinaryBytes = 0;
-this->mRunningCommand = false;
-this->mAcceptedGreeting = false;
-this->mLastElapsedMs = 0;
-this->mLastElapsedTimestampMs = 0;
+	this->mExpectedBinaryBytes = 0;
+	this->mRunningCommand = false;
+	this->mAcceptedGreeting = false;
 
 if (this->mSocket.state() != QAbstractSocket::UnconnectedState) {
 this->mSocket.abort();
@@ -240,12 +236,14 @@ this->runNextCommand();
 return;
 }
 
-auto separator = line.indexOf(':');
-if (separator <= 0) return;
+	auto separator = line.indexOf(':');
+	if (separator <= 0) return;
 
-auto key = QString::fromUtf8(line.first(separator));
-auto value = QString::fromUtf8(line.sliced(separator + 2));
-this->mResponseMap.insert(key, value);
+	auto key = QString::fromUtf8(line.first(separator));
+	auto valueBytes = line.sliced(separator + 1);
+	if (!valueBytes.isEmpty() && valueBytes.front() == ' ') valueBytes.remove(0, 1);
+	auto value = QString::fromUtf8(valueBytes);
+	this->mResponseMap.insert(key, value);
 
 if (key == "binary") {
 this->mExpectedBinaryBytes = value.toLongLong();
@@ -300,13 +298,11 @@ this->mPlayer.setPlaybackState(MpdPlaybackState::Stopped);
 
 auto elapsed = this->mResponseMap.value("elapsed").toDouble();
 auto duration = this->mResponseMap.value("duration").toDouble();
-auto volume = this->mResponseMap.value("volume").toDouble() / 100.0;
+		auto volume = this->mResponseMap.value("volume").toDouble() / 100.0;
 
-if (elapsed >= 0) {
-this->mLastElapsedMs = static_cast<qint64>(elapsed * 1000);
-this->mLastElapsedTimestampMs = QDateTime::currentMSecsSinceEpoch();
-this->mPlayer.setPositionInternal(elapsed);
-}
+		if (elapsed >= 0) {
+			this->mPlayer.setPositionInternal(elapsed);
+		}
 
 if (duration >= 0) this->mPlayer.setLength(duration);
 if (volume >= 0) this->mPlayer.setVolumeInternal(this->clamp01(volume));

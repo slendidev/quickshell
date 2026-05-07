@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <utility>
 
 #include <qobject.h>
 #include <qproperty.h>
@@ -210,10 +211,8 @@ QVariantMap mSongMap;
 QByteArray mReadBuffer;
 QByteArray mBinaryData;
 qint64 mExpectedBinaryBytes = 0;
-bool mRunningCommand = false;
-bool mAcceptedGreeting = false;
-qint64 mLastElapsedMs = 0;
-qint64 mLastElapsedTimestampMs = 0;
+	bool mRunningCommand = false;
+	bool mAcceptedGreeting = false;
 };
 
 } // namespace qs::service::mpd
