@@ -188,6 +188,13 @@ To disable: `-DSERVICE_MPRIS=OFF`
 
 Dependencies: `qt6dbus` (usually part of qt6base)
 
+### MPD
+This feature enables access to MPD over its TCP protocol.
+
+To disable: `-DSERVICE_MPD=OFF`
+
+Dependencies: Qt network support (`qt6network`, usually part of qt6base)
+
 ### PAM
 This feature enables PAM integration for user authentication.
 
