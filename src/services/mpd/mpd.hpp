@@ -173,6 +173,10 @@ void onConnected();
 void onDisconnected();
 void onReadyRead();
 void onSocketError();
+void onControlConnected();
+void onControlDisconnected();
+void onControlReadyRead();
+void onControlSocketError();
 void onPollTimeout();
 
 private:
@@ -188,6 +192,13 @@ void sendCommand(
 void processLine(const QByteArray& line);
 void processPendingBuffer();
 void runNextCommand();
+void sendControlCommand(
+    const QString& command,
+    const std::function<void(bool success)>& callback = std::function<void(bool)>()
+);
+void runNextControlCommand();
+void processControlLine(const QByteArray& line);
+void processControlPendingBuffer();
 void updateState();
 void updateStatus();
 void updateCurrentSong();
@@ -207,14 +218,17 @@ Q_OBJECT_BINDABLE_PROPERTY(Mpd, QString, bPassword, &Mpd::passwordChanged);
 Q_OBJECT_BINDABLE_PROPERTY_WITH_ARGS(Mpd, bool, bAutoReconnect, true, &Mpd::autoReconnectChanged);
 
 QTcpSocket mSocket;
+QTcpSocket mControlSocket;
 QTimer mPollTimer;
 QTimer mReconnectTimer;
 	QTimer mPositionTimer;
 MpdPlayer mPlayer;
 QQueue<MpdCommand> mCommandQueue;
+QQueue<MpdCommand> mControlCommandQueue;
 QVariantMap mResponseMap;
 QVariantMap mSongMap;
 QByteArray mReadBuffer;
+QByteArray mControlReadBuffer;
 QByteArray mBinaryData;
 qint64 mExpectedBinaryBytes = 0;
 	qreal mPositionSampleSeconds = 0;
@@ -222,6 +236,10 @@ qint64 mExpectedBinaryBytes = 0;
 	bool mPositionSampleValid = false;
 	bool mRunningCommand = false;
 	bool mAcceptedGreeting = false;
+	bool mControlRunningCommand = false;
+	bool mControlAcceptedGreeting = false;
+	bool mControlReady = false;
+	bool mPausePending = false;
 };
 
 } // namespace qs::service::mpd

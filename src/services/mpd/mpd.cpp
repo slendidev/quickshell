@@ -59,16 +59,26 @@ QObject::connect(&this->mSocket, &QTcpSocket::connected, this, &Mpd::onConnected
 QObject::connect(&this->mSocket, &QTcpSocket::disconnected, this, &Mpd::onDisconnected);
 QObject::connect(&this->mSocket, &QTcpSocket::readyRead, this, &Mpd::onReadyRead);
 QObject::connect(&this->mSocket, &QTcpSocket::errorOccurred, this, &Mpd::onSocketError);
+QObject::connect(&this->mControlSocket, &QTcpSocket::connected, this, &Mpd::onControlConnected);
+QObject::connect(&this->mControlSocket, &QTcpSocket::disconnected, this, &Mpd::onControlDisconnected);
+QObject::connect(&this->mControlSocket, &QTcpSocket::readyRead, this, &Mpd::onControlReadyRead);
+QObject::connect(&this->mControlSocket, &QTcpSocket::errorOccurred, this, &Mpd::onControlSocketError);
 QObject::connect(&this->mPollTimer, &QTimer::timeout, this, &Mpd::onPollTimeout);
 QObject::connect(&this->mReconnectTimer, &QTimer::timeout, this, &Mpd::reconnect);
 	QObject::connect(&this->mPositionTimer, &QTimer::timeout, this, &Mpd::onPositionTimeout);
 QObject::connect(&this->mPlayer, &MpdPlayer::positionChangeRequested, this, [this](qreal position) {
+this->setPositionSample(position);
+this->refreshPositionFromSample();
 auto command = QString("seekcur %1").arg(position, 0, 'f', 3);
-this->sendCommand(command);
+this->sendControlCommand(command, [this](bool success) {
+if (!success) this->updateState();
+this->updateState();
+QTimer::singleShot(100, this, [this]() { this->updateState(); });
+});
 });
 QObject::connect(&this->mPlayer, &MpdPlayer::volumeChangeRequested, this, [this](qreal volume) {
 auto targetVolume = static_cast<int>(this->clamp01(volume) * 100.0);
-this->sendCommand(QString("setvol %1").arg(targetVolume));
+this->sendControlCommand(QString("setvol %1").arg(targetVolume));
 });
 // clang-format on
 
@@ -105,7 +115,9 @@ this->mReconnectTimer.stop();
 this->mPollTimer.stop();
 	this->mPositionTimer.stop();
 this->mCommandQueue.clear();
+this->mControlCommandQueue.clear();
 this->mReadBuffer.clear();
+this->mControlReadBuffer.clear();
 this->mResponseMap.clear();
 this->mSongMap.clear();
 this->mBinaryData.clear();
@@ -115,18 +127,59 @@ this->mBinaryData.clear();
 	this->mPositionSampleValid = false;
 	this->mRunningCommand = false;
 	this->mAcceptedGreeting = false;
+	this->mControlRunningCommand = false;
+	this->mControlAcceptedGreeting = false;
+	this->mControlReady = false;
+	this->mPausePending = false;
 
 if (this->mSocket.state() != QAbstractSocket::UnconnectedState) {
 this->mSocket.abort();
 }
 
-qCDebug(logMpd) << "Connecting to MPD at" << this->bHost << this->bPort;
-this->mSocket.connectToHost(this->bHost, this->bPort);
+if (this->mControlSocket.state() != QAbstractSocket::UnconnectedState) {
+	this->mControlSocket.abort();
 }
 
-void Mpd::play() { this->sendCommand("play"); }
-void Mpd::pause() { this->sendCommand("pause 1"); }
-void Mpd::stop() { this->sendCommand("stop"); }
+qCDebug(logMpd) << "Connecting to MPD at" << this->bHost << this->bPort;
+this->mSocket.connectToHost(this->bHost, this->bPort);
+this->mControlSocket.connectToHost(this->bHost, this->bPort);
+}
+
+void Mpd::play() {
+	this->mPlayer.setPlaybackState(MpdPlaybackState::Playing);
+	if (!this->mPositionTimer.isActive()) this->mPositionTimer.start();
+	this->sendControlCommand("play", [this](bool success) {
+		if (!success) this->updateState();
+		this->updateState();
+		QTimer::singleShot(100, this, [this]() { this->updateState(); });
+	});
+}
+
+void Mpd::pause() {
+	this->mPlayer.setPlaybackState(MpdPlaybackState::Paused);
+	this->mPausePending = true;
+	if (!this->mPositionTimer.isActive()) this->mPositionTimer.start();
+	this->sendControlCommand("pause 1", [this](bool success) {
+		if (success) this->setPositionSample(this->positionFromSampleNow());
+		if (!success) this->mPausePending = false;
+		if (!success) this->updateState();
+		this->updateState();
+		QTimer::singleShot(100, this, [this]() { this->updateState(); });
+	});
+}
+
+void Mpd::stop() {
+	this->mPlayer.setPlaybackState(MpdPlaybackState::Stopped);
+	this->mPausePending = false;
+	this->mPositionTimer.stop();
+	this->setPositionSample(0);
+	this->refreshPositionFromSample();
+	this->sendControlCommand("stop", [this](bool success) {
+		if (!success) this->updateState();
+		this->updateState();
+		QTimer::singleShot(100, this, [this]() { this->updateState(); });
+	});
+}
 
 void Mpd::togglePlaying() {
 if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing) {
@@ -136,13 +189,41 @@ this->play();
 }
 }
 
-void Mpd::next() { this->sendCommand("next"); }
-void Mpd::previous() { this->sendCommand("previous"); }
+void Mpd::next() {
+	this->setPositionSample(0);
+	this->refreshPositionFromSample();
+	this->sendControlCommand("next", [this](bool success) {
+		if (!success) this->updateState();
+		this->updateState();
+		QTimer::singleShot(100, this, [this]() { this->updateState(); });
+	});
+}
+
+void Mpd::previous() {
+	this->setPositionSample(0);
+	this->refreshPositionFromSample();
+	this->sendControlCommand("previous", [this](bool success) {
+		if (!success) this->updateState();
+		this->updateState();
+		QTimer::singleShot(100, this, [this]() { this->updateState(); });
+	});
+}
 
 void Mpd::seek(qreal offset) {
+	auto target = this->positionFromSampleNow() + offset;
+	auto length = this->mPlayer.bindableLength().value();
+	if (length > 0 && target > length) target = length;
+	if (target < 0) target = 0;
+	this->setPositionSample(target);
+	this->refreshPositionFromSample();
+
 auto command = QString("seekcur %1").arg(offset >= 0 ? QString("+%1").arg(offset, 0, 'f', 3)
                                              : QString::number(offset, 'f', 3));
-this->sendCommand(command);
+this->sendControlCommand(command, [this](bool success) {
+	if (!success) this->updateState();
+	this->updateState();
+	QTimer::singleShot(100, this, [this]() { this->updateState(); });
+});
 }
 
 void Mpd::onConnected() {
@@ -150,6 +231,8 @@ qCDebug(logMpd) << "Connected to MPD";
 this->mPlayer.setConnected(true);
 emit this->connectedChanged();
 }
+
+void Mpd::onControlConnected() { qCDebug(logMpd) << "Connected control socket to MPD"; }
 
 void Mpd::onDisconnected() {
 qCDebug(logMpd) << "Disconnected from MPD";
@@ -162,12 +245,28 @@ emit this->connectedChanged();
 this->mPollTimer.stop();
 	this->mPositionTimer.stop();
 this->mCommandQueue.clear();
+this->mControlCommandQueue.clear();
 this->mRunningCommand = false;
 this->mAcceptedGreeting = false;
+	this->mControlRunningCommand = false;
+	this->mControlAcceptedGreeting = false;
+	this->mControlReady = false;
+	this->mPausePending = false;
 
 if (this->bAutoReconnect.value()) {
 this->mReconnectTimer.start();
 }
+}
+
+void Mpd::onControlDisconnected() {
+	qCDebug(logMpd) << "Disconnected control socket from MPD";
+	this->mControlCommandQueue.clear();
+	this->mControlRunningCommand = false;
+	this->mControlAcceptedGreeting = false;
+	this->mControlReady = false;
+	this->mPausePending = false;
+
+	if (this->bAutoReconnect.value()) this->mReconnectTimer.start();
 }
 
 void Mpd::onReadyRead() {
@@ -175,9 +274,19 @@ this->mReadBuffer.append(this->mSocket.readAll());
 this->processPendingBuffer();
 }
 
+void Mpd::onControlReadyRead() {
+	this->mControlReadBuffer.append(this->mControlSocket.readAll());
+	this->processControlPendingBuffer();
+}
+
 void Mpd::onSocketError() {
 if (this->mSocket.error() == QAbstractSocket::RemoteHostClosedError) return;
 qCWarning(logMpd) << "MPD socket error:" << this->mSocket.errorString();
+}
+
+void Mpd::onControlSocketError() {
+	if (this->mControlSocket.error() == QAbstractSocket::RemoteHostClosedError) return;
+	qCWarning(logMpd) << "MPD control socket error:" << this->mControlSocket.errorString();
 }
 
 void Mpd::onPollTimeout() { this->updateState(); }
@@ -201,6 +310,22 @@ this->mExpectedBinaryBytes = 0;
 this->mRunningCommand = true;
 this->mSocket.write(command.command.toUtf8());
 this->mSocket.write("\n");
+}
+
+void Mpd::sendControlCommand(const QString& command, const std::function<void(bool)>& callback) {
+	this->mControlCommandQueue.enqueue({command, callback});
+	this->runNextControlCommand();
+}
+
+void Mpd::runNextControlCommand() {
+	if (this->mControlRunningCommand || !this->mControlReady) return;
+	if (this->mControlSocket.state() != QAbstractSocket::ConnectedState) return;
+	if (this->mControlCommandQueue.isEmpty()) return;
+
+	const auto& command = this->mControlCommandQueue.head();
+	this->mControlRunningCommand = true;
+	this->mControlSocket.write(command.command.toUtf8());
+	this->mControlSocket.write("\n");
 }
 
 void Mpd::processLine(const QByteArray& line) {
@@ -288,6 +413,73 @@ this->processLine(line);
 }
 }
 
+void Mpd::processControlLine(const QByteArray& line) {
+	if (!this->mControlAcceptedGreeting) {
+		if (line.startsWith("OK MPD ")) {
+			this->mControlAcceptedGreeting = true;
+			if (this->bPassword.value().isEmpty()) {
+				this->mControlReady = true;
+				this->runNextControlCommand();
+			} else {
+				auto escaped = this->escapeMpdString(this->bPassword.value());
+				this->mControlRunningCommand = true;
+				this->mControlSocket.write(QString("password \"%1\"\n").arg(escaped).toUtf8());
+			}
+		} else {
+			qCWarning(logMpd) << "Invalid MPD control greeting:" << line;
+			this->mControlSocket.disconnectFromHost();
+		}
+
+		return;
+	}
+
+	if (!this->mControlReady) {
+		if (line == "OK") {
+			this->mControlRunningCommand = false;
+			this->mControlReady = true;
+			this->runNextControlCommand();
+		} else if (line.startsWith("ACK")) {
+			qCWarning(logMpd) << "MPD control auth failed:" << line;
+			this->mControlRunningCommand = false;
+			this->mControlSocket.disconnectFromHost();
+		}
+		return;
+	}
+
+	if (line == "OK") {
+		this->mControlRunningCommand = false;
+		if (!this->mControlCommandQueue.isEmpty()) {
+			auto command = this->mControlCommandQueue.dequeue();
+			if (command.callback) command.callback(true);
+		}
+		this->runNextControlCommand();
+		return;
+	}
+
+	if (line.startsWith("ACK")) {
+		qCWarning(logMpd) << "MPD control command failed:" << line;
+		this->mControlRunningCommand = false;
+		if (!this->mControlCommandQueue.isEmpty()) {
+			auto command = this->mControlCommandQueue.dequeue();
+			if (command.callback) command.callback(false);
+		}
+		this->runNextControlCommand();
+	}
+}
+
+void Mpd::processControlPendingBuffer() {
+	while (true) {
+		auto index = this->mControlReadBuffer.indexOf('\n');
+		if (index < 0) return;
+
+		auto line = this->mControlReadBuffer.first(index);
+		this->mControlReadBuffer.remove(0, index + 1);
+		if (!line.isEmpty() && line.back() == '\r') line.chop(1);
+
+		this->processControlLine(line);
+	}
+}
+
 void Mpd::updateState() {
 if (!this->mAcceptedGreeting) return;
 this->updateStatus();
@@ -313,6 +505,7 @@ auto duration = this->mResponseMap.value("duration").toDouble();
 		auto volume = this->mResponseMap.value("volume").toDouble() / 100.0;
 
 		if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing) {
+			this->mPausePending = false;
 			if (!this->mPositionTimer.isActive()) this->mPositionTimer.start();
 
 			if (elapsed >= 0) {
@@ -326,9 +519,18 @@ auto duration = this->mResponseMap.value("duration").toDouble();
 
 			this->refreshPositionFromSample();
 		} else {
-			this->mPositionTimer.stop();
-			if (elapsed >= 0) this->setPositionSample(elapsed);
-			this->refreshPositionFromSample();
+			if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Paused
+			    && this->mPausePending) {
+				if (!this->mPositionTimer.isActive()) this->mPositionTimer.start();
+				if (elapsed >= 0) this->setPositionSample(elapsed);
+				this->refreshPositionFromSample();
+			} else {
+				this->mPausePending = false;
+				this->setPositionSample(this->positionFromSampleNow());
+				this->mPositionTimer.stop();
+				if (elapsed >= 0) this->setPositionSample(elapsed);
+				this->refreshPositionFromSample();
+			}
 		}
 
 		if (previousState != this->mPlayer.bindablePlaybackState().value()) {
@@ -378,6 +580,7 @@ if (oldFile != newFile) {
 	this->mPositionSampleSeconds = 0;
 	this->mPositionSampleTimestamp = QDateTime();
 	this->mPositionSampleValid = false;
+	this->refreshPositionFromSample();
 this->mPlayer.setTrackArtUrl(QString());
 this->updateAlbumArt();
 }
@@ -424,6 +627,7 @@ void Mpd::clearTrackData() {
 	this->mPositionSampleSeconds = 0;
 	this->mPositionSampleTimestamp = QDateTime();
 	this->mPositionSampleValid = false;
+	this->mPausePending = false;
 this->mPlayer.setPlaybackState(MpdPlaybackState::Stopped);
 this->mPlayer.setTrackTitle(QString());
 this->mPlayer.setTrackArtist(QString());
@@ -439,7 +643,8 @@ qreal Mpd::positionFromSampleNow() const {
 	if (!this->mPositionSampleValid) return this->mPlayer.bindablePosition().value();
 
 	auto position = this->mPositionSampleSeconds;
-	if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing
+	if ((this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing
+	     || this->mPausePending)
 	    && this->mPositionSampleTimestamp.isValid()) {
 		position += static_cast<qreal>(
 		    this->mPositionSampleTimestamp.msecsTo(QDateTime::currentDateTimeUtc())
