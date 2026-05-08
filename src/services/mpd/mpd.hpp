@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <qobject.h>
+#include <qhash.h>
 #include <qproperty.h>
 #include <qqueue.h>
 #include <qstring.h>
@@ -180,6 +181,15 @@ void onControlSocketError();
 void onPollTimeout();
 
 private:
+struct SongCacheEntry {
+QString title;
+QString artist;
+QString album;
+QVariantMap metadata;
+QString artUrl;
+bool artFetched = false;
+};
+
 struct MpdCommand {
 QString command;
 std::function<void(bool success)> callback;
@@ -208,6 +218,12 @@ void onPositionTimeout();
 QString escapeMpdString(const QString& value) const;
 qreal clamp01(qreal value) const;
 void setSongField(const QString& key, const QString& value);
+void cacheSongData(const QString& file, const QVariantMap& songMap);
+bool applyCachedSongData(const QString& file);
+bool shouldFetchAlbumArt(const QString& file) const;
+void cacheAlbumArt(const QString& file, const QString& artUrl, bool fetched);
+void clearSongCache();
+void evictSongCacheEntriesIfNeeded();
 qreal positionFromSampleNow() const;
 void setPositionSample(qreal sampleSeconds);
 void refreshPositionFromSample();
@@ -226,11 +242,15 @@ MpdPlayer mPlayer;
 QQueue<MpdCommand> mCommandQueue;
 QQueue<MpdCommand> mControlCommandQueue;
 QVariantMap mResponseMap;
+QVariantMap mControlResponseMap;
 QVariantMap mSongMap;
 QByteArray mReadBuffer;
 QByteArray mControlReadBuffer;
 QByteArray mBinaryData;
 qint64 mExpectedBinaryBytes = 0;
+	QHash<QString, SongCacheEntry> mSongCache;
+	QQueue<QString> mSongCacheOrder;
+	static constexpr int SongCacheCapacity = 200;
 	qreal mPositionSampleSeconds = 0;
 	QDateTime mPositionSampleTimestamp;
 	bool mPositionSampleValid = false;

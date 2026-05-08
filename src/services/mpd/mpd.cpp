@@ -115,10 +115,11 @@ this->mReconnectTimer.stop();
 this->mPollTimer.stop();
 	this->mPositionTimer.stop();
 this->mCommandQueue.clear();
-this->mControlCommandQueue.clear();
-this->mReadBuffer.clear();
-this->mControlReadBuffer.clear();
+	this->mControlCommandQueue.clear();
+	this->mReadBuffer.clear();
+	this->mControlReadBuffer.clear();
 this->mResponseMap.clear();
+	this->mControlResponseMap.clear();
 this->mSongMap.clear();
 this->mBinaryData.clear();
 	this->mExpectedBinaryBytes = 0;
@@ -131,6 +132,7 @@ this->mBinaryData.clear();
 	this->mControlAcceptedGreeting = false;
 	this->mControlReady = false;
 	this->mPausePending = false;
+	this->clearSongCache();
 
 if (this->mSocket.state() != QAbstractSocket::UnconnectedState) {
 this->mSocket.abort();
@@ -252,6 +254,7 @@ this->mAcceptedGreeting = false;
 	this->mControlAcceptedGreeting = false;
 	this->mControlReady = false;
 	this->mPausePending = false;
+	this->clearSongCache();
 
 if (this->bAutoReconnect.value()) {
 this->mReconnectTimer.start();
@@ -324,6 +327,7 @@ void Mpd::runNextControlCommand() {
 
 	const auto& command = this->mControlCommandQueue.head();
 	this->mControlRunningCommand = true;
+	this->mControlResponseMap.clear();
 	this->mControlSocket.write(command.command.toUtf8());
 	this->mControlSocket.write("\n");
 }
@@ -464,7 +468,17 @@ void Mpd::processControlLine(const QByteArray& line) {
 			if (command.callback) command.callback(false);
 		}
 		this->runNextControlCommand();
+		return;
 	}
+
+	auto separator = line.indexOf(':');
+	if (separator <= 0) return;
+
+	auto key = QString::fromUtf8(line.first(separator));
+	auto valueBytes = line.sliced(separator + 1);
+	if (!valueBytes.isEmpty() && valueBytes.front() == ' ') valueBytes.remove(0, 1);
+	auto value = QString::fromUtf8(valueBytes);
+	this->mControlResponseMap.insert(key, value);
 }
 
 void Mpd::processControlPendingBuffer() {
@@ -487,11 +501,11 @@ this->updateCurrentSong();
 }
 
 void Mpd::updateStatus() {
-this->sendCommand("status", [this](bool success) {
+this->sendControlCommand("status", [this](bool success) {
 if (!success) return;
 
 	auto previousState = this->mPlayer.bindablePlaybackState().value();
-auto state = this->mResponseMap.value("state").toString();
+	auto state = this->mControlResponseMap.value("state").toString();
 if (state == "play") {
 this->mPlayer.setPlaybackState(MpdPlaybackState::Playing);
 } else if (state == "pause") {
@@ -500,9 +514,9 @@ this->mPlayer.setPlaybackState(MpdPlaybackState::Paused);
 this->mPlayer.setPlaybackState(MpdPlaybackState::Stopped);
 }
 
-auto elapsed = this->mResponseMap.value("elapsed").toDouble();
-auto duration = this->mResponseMap.value("duration").toDouble();
-		auto volume = this->mResponseMap.value("volume").toDouble() / 100.0;
+	auto elapsed = this->mControlResponseMap.value("elapsed").toDouble();
+	auto duration = this->mControlResponseMap.value("duration").toDouble();
+		auto volume = this->mControlResponseMap.value("volume").toDouble() / 100.0;
 
 		if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing) {
 			this->mPausePending = false;
@@ -567,13 +581,16 @@ for (auto it = this->mResponseMap.cbegin(); it != this->mResponseMap.cend(); ++i
 this->setSongField(it.key(), it.value().toString());
 }
 
-this->mPlayer.setMetadata(this->mSongMap);
-this->mPlayer.setTrackTitle(this->mSongMap.value("title").toString());
-this->mPlayer.setTrackArtist(this->mSongMap.value("artist").toString());
-this->mPlayer.setTrackAlbum(this->mSongMap.value("album").toString());
-
 auto oldFile = this->mPlayer.bindableTrackFile().value();
 auto newFile = this->mSongMap.value("file").toString();
+
+	if (!newFile.isEmpty()) this->applyCachedSongData(newFile);
+	if (!newFile.isEmpty()) this->cacheSongData(newFile, this->mSongMap);
+
+	this->mPlayer.setMetadata(this->mSongMap);
+	this->mPlayer.setTrackTitle(this->mSongMap.value("title").toString());
+	this->mPlayer.setTrackArtist(this->mSongMap.value("artist").toString());
+	this->mPlayer.setTrackAlbum(this->mSongMap.value("album").toString());
 this->mPlayer.setTrackFile(newFile);
 
 if (oldFile != newFile) {
@@ -581,8 +598,12 @@ if (oldFile != newFile) {
 	this->mPositionSampleTimestamp = QDateTime();
 	this->mPositionSampleValid = false;
 	this->refreshPositionFromSample();
-this->mPlayer.setTrackArtUrl(QString());
-this->updateAlbumArt();
+	if (newFile.isEmpty()) {
+		this->mPlayer.setTrackArtUrl(QString());
+	} else if (this->shouldFetchAlbumArt(newFile)) {
+		this->mPlayer.setTrackArtUrl(QString());
+		this->updateAlbumArt();
+	}
 }
 
 auto duration = this->mSongMap.value("time").toString();
@@ -602,24 +623,99 @@ if (file.isEmpty()) return;
 
 auto escaped = this->escapeMpdString(file);
 
-auto applyPicture = [this](bool success) {
+auto applyPicture = [this, file](bool success) {
 if (!success || this->mBinaryData.isEmpty()) return false;
 
 auto mimeType = this->mResponseMap.value("type").toString();
 if (mimeType.isEmpty()) mimeType = "image/jpeg";
 auto url = QString("data:%1;base64,%2")
                .arg(mimeType, QString::fromUtf8(this->mBinaryData.toBase64()));
-this->mPlayer.setTrackArtUrl(url);
+	if (this->mPlayer.bindableTrackFile().value() == file) this->mPlayer.setTrackArtUrl(url);
+	this->cacheAlbumArt(file, url, true);
 return true;
 };
 
-this->sendCommand(QString("readpicture \"%1\" 0").arg(escaped), [this, applyPicture, escaped](bool success) {
+this->sendCommand(QString("readpicture \"%1\" 0").arg(escaped), [this, applyPicture, escaped, file](bool success) {
 if (applyPicture(success)) return;
 
-this->sendCommand(QString("albumart \"%1\" 0").arg(escaped), [this, applyPicture](bool fallbackSuccess) {
-applyPicture(fallbackSuccess);
+this->sendCommand(QString("albumart \"%1\" 0").arg(escaped), [this, applyPicture, file](bool fallbackSuccess) {
+		if (!applyPicture(fallbackSuccess)) {
+			this->cacheAlbumArt(file, QString(), true);
+		}
 });
 });
+}
+
+void Mpd::cacheSongData(const QString& file, const QVariantMap& songMap) {
+	if (file.isEmpty()) return;
+
+	auto it = this->mSongCache.find(file);
+	if (it == this->mSongCache.end()) {
+		SongCacheEntry entry;
+		entry.title = songMap.value("title").toString();
+		entry.artist = songMap.value("artist").toString();
+		entry.album = songMap.value("album").toString();
+		entry.metadata = songMap;
+		this->mSongCache.insert(file, std::move(entry));
+		this->mSongCacheOrder.enqueue(file);
+		this->evictSongCacheEntriesIfNeeded();
+		return;
+	}
+
+	it->title = songMap.value("title").toString();
+	it->artist = songMap.value("artist").toString();
+	it->album = songMap.value("album").toString();
+	it->metadata = songMap;
+}
+
+bool Mpd::applyCachedSongData(const QString& file) {
+	if (file.isEmpty()) return false;
+	auto it = this->mSongCache.constFind(file);
+	if (it == this->mSongCache.cend()) return false;
+
+	this->mPlayer.setMetadata(it->metadata);
+	this->mPlayer.setTrackTitle(it->title);
+	this->mPlayer.setTrackArtist(it->artist);
+	this->mPlayer.setTrackAlbum(it->album);
+	this->mPlayer.setTrackArtUrl(it->artUrl);
+	return true;
+}
+
+bool Mpd::shouldFetchAlbumArt(const QString& file) const {
+	if (file.isEmpty()) return false;
+	auto it = this->mSongCache.constFind(file);
+	if (it == this->mSongCache.cend()) return true;
+	return !it->artFetched;
+}
+
+void Mpd::cacheAlbumArt(const QString& file, const QString& artUrl, bool fetched) {
+	if (file.isEmpty()) return;
+
+	auto it = this->mSongCache.find(file);
+	if (it == this->mSongCache.end()) {
+		SongCacheEntry entry;
+		entry.artUrl = artUrl;
+		entry.artFetched = fetched;
+		this->mSongCache.insert(file, std::move(entry));
+		this->mSongCacheOrder.enqueue(file);
+		this->evictSongCacheEntriesIfNeeded();
+		return;
+	}
+
+	it->artUrl = artUrl;
+	it->artFetched = fetched;
+}
+
+void Mpd::clearSongCache() {
+	this->mSongCache.clear();
+	this->mSongCacheOrder.clear();
+}
+
+void Mpd::evictSongCacheEntriesIfNeeded() {
+	while (this->mSongCache.size() > SongCacheCapacity && !this->mSongCacheOrder.isEmpty()) {
+		auto file = this->mSongCacheOrder.dequeue();
+		this->mSongCache.remove(file);
+	}
 }
 
 void Mpd::clearTrackData() {
