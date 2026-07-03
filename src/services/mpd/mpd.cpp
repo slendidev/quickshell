@@ -739,8 +739,7 @@ qreal Mpd::positionFromSampleNow() const {
 	if (!this->mPositionSampleValid) return this->mPlayer.bindablePosition().value();
 
 	auto position = this->mPositionSampleSeconds;
-	if ((this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing
-	     || this->mPausePending)
+	if (this->mPlayer.bindablePlaybackState().value() == MpdPlaybackState::Playing
 	    && this->mPositionSampleTimestamp.isValid()) {
 		position += static_cast<qreal>(
 		    this->mPositionSampleTimestamp.msecsTo(QDateTime::currentDateTimeUtc())
